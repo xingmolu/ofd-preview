@@ -83,8 +83,21 @@ export class OfdParser {
       : new Error(`Unable to render page ${pageIndex + 1}`);
   }
 
-  async pageToSvg(buffer: Buffer, doc: ParsedDoc, pageIndex: number): Promise<RenderedPage> {
-    return this.renderPage(buffer, doc, pageIndex);
+  async pageToSvg(buffer: Buffer, docOrPath: ParsedDoc | string, pageIndex?: number): Promise<RenderedPage> {
+    if (typeof docOrPath === 'string') {
+      const doc = await this.parse(buffer);
+      const index = doc.pageRefs.findIndex((ref) => ref === docOrPath);
+      if (index === -1) {
+        throw new Error(`Page not found: ${docOrPath}`);
+      }
+      return this.renderPage(buffer, doc, index);
+    }
+
+    if (typeof pageIndex !== 'number') {
+      throw new Error('page index is required when passing ParsedDoc');
+    }
+
+    return this.renderPage(buffer, docOrPath, pageIndex);
   }
 
   private async resolveAvailableStrategies(): Promise<OfdRenderingStrategy[]> {

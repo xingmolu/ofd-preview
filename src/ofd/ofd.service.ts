@@ -8,8 +8,8 @@ import PDFDocument from 'pdfkit';
 const SVGtoPDF = require('svg-to-pdfkit');
 import LRU from 'lru-cache';
 
-interface CacheEntryDoc { doc: ParsedDoc; buf: Buffer; }
-interface CacheEntryPage { svg: string; text: PageTextItem[]; }
+interface CacheEntryDoc { doc: ParsedDoc; buf: Buffer; key: string; mtimeMs: number; }
+interface CacheEntryPage { svg: string; text: PageTextItem[]; docMtimeMs: number; }
 interface DocumentInfo { meta: OfdMetadata; capabilities: OfdDocumentCapabilities; engine: string; }
 
 @Injectable()
@@ -31,15 +31,18 @@ export class OfdService {
   }
 
   private async loadDoc(fileParam: string): Promise<CacheEntryDoc> {
-    const resolved = this.files.resolve(fileParam);
+    const resolved = await this.files.resolve(fileParam);
     const key = resolved.absolutePath;
+    const mtimeMs = resolved.mtimeMs;
+
     const existing = this.docCache.get(key);
-    if (existing) return existing;
+    if (existing && existing.mtimeMs === mtimeMs) {
+      return existing;
+    }
 
-    const buf = readFileSync(resolved.absolutePath);
-
+    const buf = readFileSync(key);
     const parsed = await this.withTimeout(this.parser.parse(buf), 15000);
-    const entry = { doc: parsed, buf };
+    const entry: CacheEntryDoc = { doc: parsed, buf, key, mtimeMs };
     this.docCache.set(key, entry);
     return entry;
   }
@@ -59,15 +62,15 @@ export class OfdService {
     return doc.capabilities;
   }
 
-  async getPage(fileParam: string, page: number, format: 'svg'|'png'|'pdf', scale = 1) {
-    const { doc, buf } = await this.loadDoc(fileParam);
+  async getPage(fileParam: string, page: number, format: 'svg' | 'png' | 'pdf', scale = 1) {
+    const { doc, buf, key, mtimeMs } = await this.loadDoc(fileParam);
     if (page < 1 || page > doc.meta.pages) throw new Error('Invalid page index');
 
-    const cacheKey = `${this.files.resolve(fileParam).absolutePath}#${page}`;
+    const cacheKey = `${key}#${page}`;
     let pageEntry = this.pageCache.get(cacheKey);
-    if (!pageEntry) {
+    if (!pageEntry || pageEntry.docMtimeMs !== mtimeMs) {
       const rendered = await this.withTimeout(this.parser.renderPage(buf, doc, page - 1), 20000);
-      pageEntry = { svg: rendered.svg, text: rendered.text ?? [] };
+      pageEntry = { svg: rendered.svg, text: rendered.text ?? [], docMtimeMs: mtimeMs };
       this.pageCache.set(cacheKey, pageEntry);
     }
 
@@ -76,13 +79,14 @@ export class OfdService {
     }
 
     if (format === 'png') {
-      const density = Math.max(96, Math.floor(96 * (scale && scale > 0 ? scale : 1)));
-      const widthPx = Math.max(1, Math.round(this.mmToPx(doc.meta.widthMM) * (scale || 1)));
-      const heightPx = Math.max(1, Math.round(this.mmToPx(doc.meta.heightMM) * (scale || 1)));
-      const bufPng = await sharp(Buffer.from(pageEntry.svg), { density })
-        .resize({ width: widthPx, height: heightPx, fit: 'fill' })
-        .png({ compressionLevel: 9 })
-        .toBuffer();
+      const svgBuffer = Buffer.from(pageEntry.svg, 'utf-8');
+      const baseImage = sharp(svgBuffer);
+      const metadata = await baseImage.metadata();
+      let pipeline = sharp(svgBuffer);
+      if (scale && scale > 0 && scale !== 1 && metadata.width) {
+        pipeline = pipeline.resize({ width: Math.max(1, Math.floor(metadata.width * scale)), withoutEnlargement: false });
+      }
+      const bufPng = await pipeline.png({ compressionLevel: 9 }).toBuffer();
       return { contentType: 'image/png', body: bufPng };
     }
 
@@ -104,13 +108,13 @@ export class OfdService {
   }
 
   async getText(fileParam: string, page: number) {
-    const { doc, buf } = await this.loadDoc(fileParam);
+    const { doc, buf, key, mtimeMs } = await this.loadDoc(fileParam);
     if (page < 1 || page > doc.meta.pages) throw new Error('Invalid page index');
-    const cacheKey = `${this.files.resolve(fileParam).absolutePath}#${page}`;
+    const cacheKey = `${key}#${page}`;
     let pageEntry = this.pageCache.get(cacheKey);
-    if (!pageEntry) {
+    if (!pageEntry || pageEntry.docMtimeMs !== mtimeMs) {
       const rendered = await this.withTimeout(this.parser.renderPage(buf, doc, page - 1), 20000);
-      pageEntry = { svg: rendered.svg, text: rendered.text ?? [] };
+      pageEntry = { svg: rendered.svg, text: rendered.text ?? [], docMtimeMs: mtimeMs };
       this.pageCache.set(cacheKey, pageEntry);
     }
     return { items: pageEntry.text };
@@ -122,19 +126,17 @@ export class OfdService {
     return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
   }
 
-  private mmToPx(mm: number, dpi = 96) {
-    return (mm / 25.4) * dpi;
-  }
-
   private mmToPt(mm: number) {
     return (mm / 25.4) * 72.0;
   }
 
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-    let timer: any;
+    let timer: NodeJS.Timeout | undefined;
     const t = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error('Operation timed out')), ms);
     });
-    return Promise.race([p.finally(() => clearTimeout(timer)), t]);
+    return Promise.race([p.finally(() => {
+      if (timer) clearTimeout(timer);
+    }), t]);
   }
 }

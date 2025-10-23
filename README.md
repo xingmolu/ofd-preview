@@ -6,7 +6,8 @@ This implementation focuses on safety and simplicity while providing a working p
 
 ## Features
 
-- Preview OFD via browser: http://127.0.0.1:3000/url?file=/data/sample.ofd
+- Preview OFD via browser: http://127.0.0.1:3000/url?file=/data/sample.ofd or http://127.0.0.1:3000/url?file=https://example.com/sample.ofd
+- Viewer UI rebuilt with React 18 + Ant Design 5 (served statically via CDN) with responsive layout and Ant Design components
 - APIs
   - GET `/api/ofd/metadata?file=...` — pages, size (mm), title, author, creation date, extractable text flag, negotiated capabilities, active renderer
   - GET `/api/ofd/page?file=...&page=<n>&format=svg|png|pdf` — render a page as SVG/PNG/PDF
@@ -14,11 +15,9 @@ This implementation focuses on safety and simplicity while providing a working p
   - POST `/api/upload` — upload OFD and get a temporary `id` to reference as `file=id:<id>`
   - GET `/api/ofd/raw?file=...` — download the original OFD
 - Frontend `/url` page
-  - Fixed toolbar with zoom in/out/reset, previous/next, goto page, download current page (PNG/PDF), download original OFD, toggle text selection
-  - Smooth CSS transform zoom; SVG stays crisp at high zoom
-  - Keyboard shortcuts: `+` zoom in, `-` zoom out, `0` reset, arrow keys turn pages, Ctrl/Cmd+F shows search placeholder
-  - Basic touch: swipe to turn pages, pinch to zoom
-  - Loading and error states
+  - Ant Design toolbar with zoom, pagination, goto page, download current page (PNG/PDF), download original OFD, toggle text selection
+  - Keyboard shortcuts: `+` zoom in, `-` zoom out, `0` reset, arrow keys turn pages
+  - Remote/local file input with history update, loading indicators, inline error feedback via Ant Design `message` / `Alert`
 - Caching: in-memory LRU for parsed docs and rendered SVG pages (TTL 10 min)
 - Security: path is restricted to OFD_ROOT or upload ids; prevents path traversal; file size limits
 - Limits: file size, parse timeout, helpful error codes
@@ -40,6 +39,10 @@ When only the basic strategy is active, the following limitations remain:
 - Multi-document OFD packages remain unsupported
 
 Configure an OFDRW-compatible CLI to unlock the advanced features required for production workloads.
+
+## Remote OFD Support
+
+The backend transparently downloads HTTP/HTTPS OFD files, validates their size, and caches them under `OFD_ROOT/remote-cache`. Cache lifetime and download timeout can be tuned with `OFD_REMOTE_CACHE_TTL` and `OFD_REMOTE_TIMEOUT`. Metadata, page rendering, and raw download endpoints accept remote URLs directly, enabling `/url?file=https://example.com/sample.ofd` style previews without preprocessing.
 
 ## Getting Started
 
@@ -80,6 +83,8 @@ npm run start:prod
 - `OFDRW_TIMEOUT` — override the CLI invocation timeout in milliseconds (default 20000)
 - `OFDRW_DISABLE` — set to `true`/`1`/`yes` to skip the OFDRW strategy even when `OFDRW_CLI` is configured
 - `OFDRW_KEEP_ARTIFACTS` — set to `1` to retain temporary working directories produced by the CLI for debugging
+- `OFD_REMOTE_CACHE_TTL` — cache duration for downloaded remote OFD files in milliseconds (default 300000)
+- `OFD_REMOTE_TIMEOUT` — timeout for downloading remote OFD files in milliseconds (default 20000)
 
 ### OFDRW CLI Contract
 
