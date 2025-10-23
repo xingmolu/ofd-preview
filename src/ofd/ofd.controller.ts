@@ -11,8 +11,8 @@ export class OfdController {
   @Get('/api/ofd/metadata')
   async metadata(@Query('file') file: string) {
     try {
-      const meta = await this.ofd.getMetadata(file);
-      return meta;
+      const info = await this.ofd.getDocumentInfo(file);
+      return { ...info.meta, capabilities: info.capabilities, engine: info.engine };
     } catch (e: any) {
       if (e?.status) throw e;
       throw new BadRequestException(e?.message || 'Failed to parse OFD');

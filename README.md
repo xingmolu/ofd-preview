@@ -8,7 +8,7 @@ This implementation focuses on safety and simplicity while providing a working p
 
 - Preview OFD via browser: http://127.0.0.1:3000/url?file=/data/sample.ofd
 - APIs
-  - GET `/api/ofd/metadata?file=...` — pages, size (mm), title, author, creation date, whether text extractable
+  - GET `/api/ofd/metadata?file=...` — pages, size (mm), title, author, creation date, extractable text flag, negotiated capabilities, active renderer
   - GET `/api/ofd/page?file=...&page=<n>&format=svg|png|pdf` — render a page as SVG/PNG/PDF
   - GET `/api/ofd/text?file=...&page=<n>` — extract text positions for a page (if possible)
   - POST `/api/upload` — upload OFD and get a temporary `id` to reference as `file=id:<id>`
@@ -23,29 +23,23 @@ This implementation focuses on safety and simplicity while providing a working p
 - Security: path is restricted to OFD_ROOT or upload ids; prevents path traversal; file size limits
 - Limits: file size, parse timeout, helpful error codes
 
-## Compatibility and Strategy
+## Compatibility and Rendering Strategies
 
-This project uses a simple OFD XML parser that supports a subset of OFD:
-- Reads `OFD.xml` for DocInfo and Document path
-- Parses `Document.xml` for page list and `PageArea.PhysicalBox` (page size in mm)
-- Renders pages by handling `Content/Layer/TextObject/TextCode` with `X`, `Y`, and `Size` attributes into SVG `<text>` nodes
+`src/ofd/parser.ts` now orchestrates a chain of rendering strategies so that the backend can adapt to different levels of OFD complexity without code changes:
 
-Tested and compatible with:
-- The bundled sample at `/data/sample.ofd` (text-only, 1-page)
-- OFD files that primarily contain simple TextObject/TextCode instructions without complex fonts/resources/CTM
+1. **OFDRW CLI strategy (optional).** When the environment variable `OFDRW_CLI` points to a binary or script that understands the expected CLI contract, the service delegates metadata extraction and page rendering to it. This is ideal for wrappers around [ofdrw](https://github.com/ofdrw/ofdrw) or any other robust renderer and unlocks support for complex graphics, embedded fonts, annotations, and electronic signatures.
+2. **Basic XML fallback.** If no CLI is configured (or the CLI becomes unavailable), the built-in TypeScript strategy parses the OFD package directly and renders TextObject/TextCode instructions into SVG. This preserves the previous behaviour and keeps the application self-contained.
 
-Known limitations (not yet supported or partially supported):
-- Complex graphics (paths, images, clipping, CTM transforms)
-- Fonts defined in resources, character mapping, kerning, vertical text, glyph substitutions
-- Multi-layer interactions, annotations, e-seals, signatures
-- Multi-document OFD packages
+The parser automatically uses the first available strategy and falls back when a strategy errors out. Metadata responses now return a `capabilities` object describing the negotiated features (text, vector drawing, images, annotations, signatures) so the frontend can react accordingly.
 
-If your OFD relies on vendor-specific extensions or advanced features (some government systems, certain export tools), the renderer may fail to parse or show a simplified placeholder. In such cases:
-- Use `format=svg` for best fidelity when text objects exist
-- Try exporting the OFD using a different tool or a simplified layout
-- Consider integrating a mature converter such as [ofdrw (Java)](https://github.com/ofdrw/ofdrw) in a sidecar service, then adapt `OfdService` to call it for universal rendering
+When only the basic strategy is active, the following limitations remain:
+- Complex graphics (paths, images, clipping, CTM transforms) are not drawn
+- Fonts defined in resource packages are not embedded; system fallbacks are used
+- Advanced layout features such as vertical text, kerning, or glyph substitutions are ignored
+- Annotations, stamps, and e-seals are not rendered
+- Multi-document OFD packages remain unsupported
 
-The code is structured so the parsing/rendering layer can be replaced with a more feature-complete library or a service call.
+Configure an OFDRW-compatible CLI to unlock the advanced features required for production workloads.
 
 ## Getting Started
 
@@ -82,6 +76,27 @@ npm run start:prod
 - `PORT` — server port (default 3000)
 - `OFD_ROOT` — the root directory for OFD files (default `/data`). Absolute paths are only allowed if inside this directory. The sample file is created here.
 - `MAX_OFD_SIZE` — maximum OFD size in bytes (default 104857600, i.e., 100 MiB)
+- `OFDRW_CLI` — optional path to an executable or script that implements the OFDRW-compatible CLI used by `OfdService`
+- `OFDRW_TIMEOUT` — override the CLI invocation timeout in milliseconds (default 20000)
+- `OFDRW_DISABLE` — set to `true`/`1`/`yes` to skip the OFDRW strategy even when `OFDRW_CLI` is configured
+- `OFDRW_KEEP_ARTIFACTS` — set to `1` to retain temporary working directories produced by the CLI for debugging
+
+### OFDRW CLI Contract
+
+When `OFDRW_CLI` is configured the command is invoked with the following expectations:
+
+- `OFDRW_CLI metadata <input.ofd>` must write a JSON object to `stdout` containing:
+  ```json
+  {
+    "meta": { "pages": 1, "widthMM": 210, "heightMM": 297, "title": "...", "author": "...", "creationDate": "...", "textExtractable": true },
+    "capabilities": { "text": true, "vector": true, "images": true, "annotations": true, "signatures": true },
+    "pageRefs": ["page-1", "page-2"]
+  }
+  ```
+  `capabilities` and `pageRefs` are optional; sensible defaults are applied when they are omitted.
+- `OFDRW_CLI render --page <n> --format svg --output <outputBase> <input.ofd>` must create `<outputBase>.svg`. Optionally write `<outputBase>.json` with an array of text items that match `PageTextItem`.
+
+Any script or binary that fulfils this contract can drive the advanced renderer.
 
 ### Uploading Files
 
@@ -124,10 +139,10 @@ docker run --rm -p 3000:3000 -e OFD_ROOT=/data -v $(pwd)/data:/data ofd-viewer
 
 The container will create `/data/sample.ofd` on first start if not present.
 
-## Replacing the Parser/Renderer
+## Extending the Renderer
 
-For better compatibility with mainstream OFD implementations (including X-OFD and various vendor exports), consider integrating a robust converter:
-- Java: ofdrw-converter to SVG/PDF/PNG; expose via HTTP or CLI and adapt `OfdService`
-- Native services: connect to an internal rendering service that supports your files
+The strategy pipeline in `src/ofd/parser.ts` is intentionally open-ended:
+- Point `OFDRW_CLI` at any command that produces metadata JSON and per-page SVG (with optional text JSON) following the documented contract to gain full OFD compatibility via external renderers such as ofdrw.
+- Implement your own `OfdRenderingStrategy` (for example, an HTTP bridge or a WASM renderer) and pass it to `new OfdParser({ strategies: [...] })` inside `OfdService` if you need tighter control.
 
-This code isolates parsing in `src/ofd/parser.ts` so you can swap it with a more complete approach. When unsupported features are encountered, APIs return readable errors, and the viewer shows an error message with options to retry or upload another file.
+Unsupported features still surface readable errors and the viewer informs the user with options to retry or upload another file.

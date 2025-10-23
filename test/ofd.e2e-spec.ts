@@ -23,6 +23,9 @@ describe('OFD API (e2e)', () => {
     const res = await request(app.getHttpServer()).get('/api/ofd/metadata').query({ file: '/data/sample.ofd' }).expect(200);
     expect(res.body.pages).toBeGreaterThanOrEqual(1);
     expect(res.body.textExtractable).toBe(true);
+    expect(res.body.capabilities).toBeDefined();
+    expect(res.body.capabilities.text).toBe(true);
+    expect(res.body.engine).toBeDefined();
   });
 
   it('GET /api/ofd/page returns svg', async () => {

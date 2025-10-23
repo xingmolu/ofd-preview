@@ -26,6 +26,7 @@
     <button id="zoomIn" title="放大">+</button>
     <button id="resetZoom" title="还原">100%</button>
     <span class="status" id="zoomLabel">100%</span>
+    <span class="status" id="engineStatus"></span>
 
     <button id="prevPage" title="前一页">←</button>
     <button id="nextPage" title="下一页">→</button>
@@ -57,7 +58,14 @@
     const params = new URLSearchParams(location.search);
     const file = params.get('file') || 'sample.ofd';
 
-    const state = { page: 1, total: 1, zoom: parseFloat(localStorage.getItem('zoom') || '1'), textSelectable: localStorage.getItem('textSelectable') === '1' };
+    const state = {
+      page: 1,
+      total: 1,
+      zoom: parseFloat(localStorage.getItem('zoom') || '1'),
+      textSelectable: localStorage.getItem('textSelectable') === '1',
+      engine: '',
+      capabilities: null,
+    };
 
     const zoomLabel = document.getElementById('zoomLabel');
     const totalPages = document.getElementById('totalPages');
@@ -65,6 +73,7 @@
     const svgHolder = document.getElementById('svgHolder');
     const imgHolder = document.getElementById('imgHolder');
     const pdfHolder = document.getElementById('pdfHolder');
+    const engineStatus = document.getElementById('engineStatus');
 
     function setZoom(z) {
       state.zoom = Math.max(0.2, Math.min(4, z));
@@ -80,17 +89,44 @@
       localStorage.setItem('textSelectable', on ? '1' : '0');
     }
 
+    function updateEngineStatus() {
+      if (!engineStatus) return;
+      const caps = state.capabilities || {};
+      const mark = (value) => value === undefined ? '?' : (value ? '✓' : '✕');
+      if (!state.engine) {
+        engineStatus.textContent = '';
+        engineStatus.title = '';
+        return;
+      }
+      let label;
+      if (state.engine === 'ofdrw-cli') label = '渲染: OFDRW';
+      else if (state.engine === 'basic') label = '渲染: 基础';
+      else label = '渲染: ' + state.engine;
+      engineStatus.textContent = label;
+      engineStatus.title = `功能: 文本=${mark(caps.text)}, 图形=${mark(caps.vector)}, 图片=${mark(caps.images)}, 注释=${mark(caps.annotations)}, 签章=${mark(caps.signatures)}`;
+    }
+
     async function loadMeta() {
       const res = await fetch(`/api/ofd/metadata?file=${encodeURIComponent(file)}`);
       if (!res.ok) throw new Error(await res.text());
       const meta = await res.json();
       state.total = meta.pages;
+      state.engine = meta.engine || '';
+      state.capabilities = meta.capabilities || null;
+      updateEngineStatus();
       totalPages.textContent = String(meta.pages);
       gotoInput.value = String(state.page);
       const toggleText = document.getElementById('toggleText');
-      if (!meta.textExtractable) {
+      const textCapable = meta.textExtractable && (!state.capabilities || state.capabilities.text !== false);
+      if (textCapable) {
+        toggleText.disabled = false;
+        toggleText.title = '文本选择模式';
+      } else {
+        state.textSelectable = false;
         toggleText.disabled = true;
+        toggleText.checked = false;
         toggleText.title = '此文件不支持文本选择';
+        setTextSelectable(false);
       }
     }
 
