@@ -1,36 +1,55 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { FileService } from './file.service';
-import { OfdParser, ParsedDoc, OfdMetadata } from './parser';
+import { OfdParser, ParsedDoc, OfdMetadata, PageTextItem, OfdDocumentCapabilities } from './parser';
 import { readFileSync } from 'fs';
 import sharp from 'sharp';
 import PDFDocument from 'pdfkit';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const SVGtoPDF = require('svg-to-pdfkit');
-import LRU from 'lru-cache';
+import { LRUCache } from 'lru-cache';
 
-interface CacheEntryDoc { doc: ParsedDoc; buf: Buffer; }
-interface CacheEntrySvg { svg: string; text: any; }
+interface CacheEntryDoc { doc: ParsedDoc; buf: Buffer; key: string; mtimeMs: number; }
+interface CacheEntryPage { svg: string; text: PageTextItem[]; docMtimeMs: number; }
+interface DocumentInfo { meta: OfdMetadata; capabilities: OfdDocumentCapabilities; engine: string; }
 
 @Injectable()
 export class OfdService {
-  private parser = new OfdParser();
-  private docCache = new LRU<string, CacheEntryDoc>({ max: 64, ttl: 10 * 60 * 1000 });
-  private pageCache = new LRU<string, CacheEntrySvg>({ max: 256, ttl: 10 * 60 * 1000 });
+  private readonly parser: OfdParser;
+  private docCache = new LRUCache<string, CacheEntryDoc>({ max: 64, ttl: 10 * 60 * 1000 });
+  private pageCache = new LRUCache<string, CacheEntryPage>({ max: 256, ttl: 10 * 60 * 1000 });
 
-  constructor(private readonly files: FileService) {}
+  constructor(private readonly files: FileService) {
+    const disableOfdrw = this.parseBoolean(process.env.OFDRW_DISABLE);
+    const timeoutEnv = process.env.OFDRW_TIMEOUT;
+    const parsedTimeout = timeoutEnv ? parseInt(timeoutEnv, 10) : undefined;
+    const timeout = parsedTimeout !== undefined && !Number.isNaN(parsedTimeout) ? parsedTimeout : undefined;
+    this.parser = new OfdParser({
+      disableOfdrw,
+      ofdrwCliPath: process.env.OFDRW_CLI || process.env.OFDRW_CLI_PATH,
+      strategyTimeoutMs: timeout,
+    });
+  }
 
   private async loadDoc(fileParam: string): Promise<CacheEntryDoc> {
-    const resolved = this.files.resolve(fileParam);
+    const resolved = await this.files.resolve(fileParam);
     const key = resolved.absolutePath;
+    const mtimeMs = resolved.mtimeMs;
+
     const existing = this.docCache.get(key);
-    if (existing) return existing;
+    if (existing && existing.mtimeMs === mtimeMs) {
+      return existing;
+    }
 
-    const buf = readFileSync(resolved.absolutePath);
-
+    const buf = readFileSync(key);
     const parsed = await this.withTimeout(this.parser.parse(buf), 15000);
-    const entry = { doc: parsed, buf };
+    const entry: CacheEntryDoc = { doc: parsed, buf, key, mtimeMs };
     this.docCache.set(key, entry);
     return entry;
+  }
+
+  async getDocumentInfo(fileParam: string): Promise<DocumentInfo> {
+    const { doc } = await this.loadDoc(fileParam);
+    return { meta: doc.meta, capabilities: doc.capabilities, engine: doc.engine };
   }
 
   async getMetadata(fileParam: string): Promise<OfdMetadata> {
@@ -38,29 +57,38 @@ export class OfdService {
     return doc.meta;
   }
 
-  async getPage(fileParam: string, page: number, format: 'svg'|'png'|'pdf', scale = 1) {
-    const { doc, buf } = await this.loadDoc(fileParam);
+  async getCapabilities(fileParam: string): Promise<OfdDocumentCapabilities> {
+    const { doc } = await this.loadDoc(fileParam);
+    return doc.capabilities;
+  }
+
+  async getPage(fileParam: string, page: number, format: 'svg' | 'png' | 'pdf', scale = 1) {
+    const { doc, buf, key, mtimeMs } = await this.loadDoc(fileParam);
     if (page < 1 || page > doc.meta.pages) throw new Error('Invalid page index');
 
-    const cacheKey = `${this.files.resolve(fileParam).absolutePath}#${page}`;
-    let svgEntry = this.pageCache.get(cacheKey);
-    if (!svgEntry) {
-      const { svg, text } = await this.parser.pageToSvg(buf, doc.pagePaths[page - 1], doc.meta.widthMM, doc.meta.heightMM);
-      svgEntry = { svg, text };
-      this.pageCache.set(cacheKey, svgEntry);
+    const cacheKey = `${key}#${page}`;
+    let pageEntry = this.pageCache.get(cacheKey);
+    if (!pageEntry || pageEntry.docMtimeMs !== mtimeMs) {
+      const rendered = await this.withTimeout(this.parser.renderPage(buf, doc, page - 1), 20000);
+      pageEntry = { svg: rendered.svg, text: rendered.text ?? [], docMtimeMs: mtimeMs };
+      this.pageCache.set(cacheKey, pageEntry);
     }
 
     if (format === 'svg') {
-      return { contentType: 'image/svg+xml', body: Buffer.from(svgEntry.svg, 'utf-8') };
+      return { contentType: 'image/svg+xml', body: Buffer.from(pageEntry.svg, 'utf-8') };
     }
 
     if (format === 'png') {
-      const svg = svgEntry.svg;
-      const image = sharp(Buffer.from(svg));
-      const metadata = await image.metadata();
-      let width = metadata.width;
-      if (width && scale && scale !== 1) width = Math.floor(width * scale);
-      const bufPng = await image.png({ compressionLevel: 9 }).toBuffer();
+      const svgBuffer = Buffer.from(pageEntry.svg, 'utf-8');
+      const density = Math.max(96, Math.floor(96 * (scale && scale > 0 ? scale : 1)));
+      const baseImage = sharp(svgBuffer, { density });
+      const metadata = await baseImage.metadata();
+      let pipeline = baseImage;
+      if (scale && scale > 0 && scale !== 1 && metadata.width) {
+        const targetWidth = Math.max(1, Math.floor(metadata.width * scale));
+        pipeline = pipeline.resize({ width: targetWidth, withoutEnlargement: false });
+      }
+      const bufPng = await pipeline.png({ compressionLevel: 9 }).toBuffer();
       return { contentType: 'image/png', body: bufPng };
     }
 
@@ -72,7 +100,7 @@ export class OfdService {
         docPdf.on('end', () => resolve(Buffer.concat(chunks)));
         docPdf.on('error', reject);
       });
-      SVGtoPDF(docPdf, svgEntry.svg, 0, 0, { assumePt: false, preserveAspectRatio: 'xMinYMin meet' });
+      SVGtoPDF(docPdf, pageEntry.svg, 0, 0, { assumePt: false, preserveAspectRatio: 'xMinYMin meet' });
       docPdf.end();
       const pdfBuf = await result;
       return { contentType: 'application/pdf', body: pdfBuf };
@@ -82,16 +110,22 @@ export class OfdService {
   }
 
   async getText(fileParam: string, page: number) {
-    const { doc, buf } = await this.loadDoc(fileParam);
+    const { doc, buf, key, mtimeMs } = await this.loadDoc(fileParam);
     if (page < 1 || page > doc.meta.pages) throw new Error('Invalid page index');
-    const cacheKey = `${this.files.resolve(fileParam).absolutePath}#${page}`;
-    let svgEntry = this.pageCache.get(cacheKey);
-    if (!svgEntry) {
-      const { svg, text } = await this.parser.pageToSvg(buf, doc.pagePaths[page - 1], doc.meta.widthMM, doc.meta.heightMM);
-      svgEntry = { svg, text };
-      this.pageCache.set(cacheKey, svgEntry);
+    const cacheKey = `${key}#${page}`;
+    let pageEntry = this.pageCache.get(cacheKey);
+    if (!pageEntry || pageEntry.docMtimeMs !== mtimeMs) {
+      const rendered = await this.withTimeout(this.parser.renderPage(buf, doc, page - 1), 20000);
+      pageEntry = { svg: rendered.svg, text: rendered.text ?? [], docMtimeMs: mtimeMs };
+      this.pageCache.set(cacheKey, pageEntry);
     }
-    return { items: svgEntry.text };
+    return { items: pageEntry.text };
+  }
+
+  private parseBoolean(value?: string) {
+    if (!value) return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
   }
 
   private mmToPt(mm: number) {
@@ -99,10 +133,12 @@ export class OfdService {
   }
 
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-    let timer: any;
+    let timer: NodeJS.Timeout | undefined;
     const t = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error('Operation timed out')), ms);
     });
-    return Promise.race([p.finally(() => clearTimeout(timer)), t]);
+    return Promise.race([p.finally(() => {
+      if (timer) clearTimeout(timer);
+    }), t]);
   }
 }

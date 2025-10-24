@@ -11,8 +11,8 @@ export class OfdController {
   @Get('/api/ofd/metadata')
   async metadata(@Query('file') file: string) {
     try {
-      const meta = await this.ofd.getMetadata(file);
-      return meta;
+      const info = await this.ofd.getDocumentInfo(file);
+      return { ...info.meta, capabilities: info.capabilities, engine: info.engine };
     } catch (e: any) {
       if (e?.status) throw e;
       throw new BadRequestException(e?.message || 'Failed to parse OFD');
@@ -66,9 +66,17 @@ export class OfdController {
 
   @Get('/api/ofd/raw')
   async raw(@Query('file') file: string) {
-    const stream = this.files.createReadStream(file);
+    const stream = await this.files.createReadStream(file);
+    let filename = file.split('/').pop() || 'file.ofd';
+    try {
+      const url = new URL(file);
+      const nameFromUrl = url.pathname.split('/').filter(Boolean).pop();
+      if (nameFromUrl) filename = nameFromUrl;
+    } catch (err) {
+      // not a URL, keep fallback
+    }
     return new StreamableFile(stream, {
-      disposition: `attachment; filename="${encodeURIComponent(file.split('/').pop() || 'file.ofd')}"`,
+      disposition: `attachment; filename="${encodeURIComponent(filename)}"`,
       type: 'application/ofd',
     });
   }
