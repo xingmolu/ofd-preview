@@ -1,5 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import JSZip from 'jszip';
+import path from 'path';
 import {
   OfdRenderingStrategy,
   ParsedDoc,
@@ -40,7 +41,8 @@ export class BasicOfdStrategy implements OfdRenderingStrategy {
     const docPath = docBody.Document || docBody.DocRoot || docBody.docRoot;
     if (!docPath) throw new Error('Invalid OFD: missing Document root path');
 
-    const docFile = zip.file(this.normalizeZipPath(docPath));
+    const documentPath = this.normalizeZipPath(docPath);
+    const docFile = zip.file(documentPath);
     if (!docFile) throw new Error(`Invalid OFD: Document not found at ${docPath}`);
     const docXml = await docFile.async('text');
     const docJson = this.xml.parse(docXml);
@@ -57,11 +59,11 @@ export class BasicOfdStrategy implements OfdRenderingStrategy {
 
     const pagesNode = docJson.Document?.Pages?.Page || docJson.Pages?.Page || [];
     const pagesArr = Array.isArray(pagesNode) ? pagesNode : [pagesNode];
+    const docDir = this.getDocDirectory(documentPath);
     const pagePaths: string[] = pagesArr
       .filter(Boolean)
-      .map((p: any) => p['@_BaseLoc'] || p['@_baseLoc'] || p['@_base'])
-      .filter(Boolean)
-      .map((p: string) => this.normalizeZipPath(p));
+      .map((p: any) => this.resolvePagePath(p, docDir))
+      .filter((p): p is string => Boolean(p));
 
     if (pagePaths.length === 0) throw new Error('Invalid OFD: no pages');
 
@@ -141,8 +143,48 @@ export class BasicOfdStrategy implements OfdRenderingStrategy {
     return { svg, text: extractedText };
   }
 
+  private getDocDirectory(p: string) {
+    const normalized = this.normalizeZipPath(p);
+    const idx = normalized.lastIndexOf('/');
+    return idx === -1 ? '' : normalized.substring(0, idx + 1);
+  }
+
+  private resolvePagePath(pageNode: any, docDir: string): string | undefined {
+    if (!pageNode) return undefined;
+    const candidates: (string | undefined)[] = [
+      pageNode['@_BaseLoc'] || pageNode['@_baseLoc'] || pageNode['@_base'],
+      pageNode['@_File'] || pageNode['@_file'],
+    ];
+
+    if (typeof pageNode.Content === 'string') {
+      candidates.push(pageNode.Content);
+    } else if (pageNode.Content?.['@_BaseLoc']) {
+      candidates.push(pageNode.Content['@_BaseLoc']);
+    }
+
+    for (const candidate of candidates) {
+      const resolved = this.normalizePageReference(candidate, docDir);
+      if (resolved) return resolved;
+    }
+    return undefined;
+  }
+
+  private normalizePageReference(value: string | undefined, docDir: string): string | undefined {
+    if (!value) return undefined;
+    const trimmed = `${value}`.trim();
+    if (!trimmed) return undefined;
+    let normalized = this.normalizeZipPath(trimmed);
+    if (!docDir) return normalized;
+    const docDirNormalized = docDir.endsWith('/') ? docDir : `${docDir}/`;
+    if (normalized.startsWith(docDirNormalized) || normalized === docDir.slice(0, -1)) {
+      return normalized;
+    }
+    return this.normalizeZipPath(path.posix.join(docDirNormalized, normalized));
+  }
+
   private normalizeZipPath(p: string) {
-    return p.replace(/^\.\//, '').replace(/^\//, '');
+    const normalized = path.posix.normalize(`${p}`);
+    return normalized.replace(/^\.\//, '').replace(/^\//, '');
   }
 
   private escapeXml(s: string) {

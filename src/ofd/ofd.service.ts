@@ -6,7 +6,7 @@ import sharp from 'sharp';
 import PDFDocument from 'pdfkit';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const SVGtoPDF = require('svg-to-pdfkit');
-import LRU from 'lru-cache';
+import { LRUCache } from 'lru-cache';
 
 interface CacheEntryDoc { doc: ParsedDoc; buf: Buffer; key: string; mtimeMs: number; }
 interface CacheEntryPage { svg: string; text: PageTextItem[]; docMtimeMs: number; }
@@ -15,8 +15,8 @@ interface DocumentInfo { meta: OfdMetadata; capabilities: OfdDocumentCapabilitie
 @Injectable()
 export class OfdService {
   private readonly parser: OfdParser;
-  private docCache = new LRU<string, CacheEntryDoc>({ max: 64, ttl: 10 * 60 * 1000 });
-  private pageCache = new LRU<string, CacheEntryPage>({ max: 256, ttl: 10 * 60 * 1000 });
+  private docCache = new LRUCache<string, CacheEntryDoc>({ max: 64, ttl: 10 * 60 * 1000 });
+  private pageCache = new LRUCache<string, CacheEntryPage>({ max: 256, ttl: 10 * 60 * 1000 });
 
   constructor(private readonly files: FileService) {
     const disableOfdrw = this.parseBoolean(process.env.OFDRW_DISABLE);
@@ -80,11 +80,13 @@ export class OfdService {
 
     if (format === 'png') {
       const svgBuffer = Buffer.from(pageEntry.svg, 'utf-8');
-      const baseImage = sharp(svgBuffer);
+      const density = Math.max(96, Math.floor(96 * (scale && scale > 0 ? scale : 1)));
+      const baseImage = sharp(svgBuffer, { density });
       const metadata = await baseImage.metadata();
-      let pipeline = sharp(svgBuffer);
+      let pipeline = baseImage;
       if (scale && scale > 0 && scale !== 1 && metadata.width) {
-        pipeline = pipeline.resize({ width: Math.max(1, Math.floor(metadata.width * scale)), withoutEnlargement: false });
+        const targetWidth = Math.max(1, Math.floor(metadata.width * scale));
+        pipeline = pipeline.resize({ width: targetWidth, withoutEnlargement: false });
       }
       const bufPng = await pipeline.png({ compressionLevel: 9 }).toBuffer();
       return { contentType: 'image/png', body: bufPng };

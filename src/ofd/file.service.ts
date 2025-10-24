@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { createWriteStream, existsSync, mkdirSync, statSync, createReadStream as fsCreateReadStream } from 'fs';
+import type { ReadStream } from 'fs';
 import { promises as fsp } from 'fs';
 import path from 'path';
 import { randomBytes, createHash } from 'crypto';
@@ -109,7 +110,7 @@ export class FileService {
     return id;
   }
 
-  async createReadStream(fileParam: string) {
+  async createReadStream(fileParam: string): Promise<ReadStream> {
     const res = await this.resolve(fileParam);
     return fsCreateReadStream(res.absolutePath);
   }
